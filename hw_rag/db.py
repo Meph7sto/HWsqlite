@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -34,10 +34,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE documents (
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL UNIQUE,
+            relative_path TEXT NOT NULL,
             abs_path TEXT NOT NULL,
             sha256 TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
             extension TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_root TEXT NOT NULL,
             corpus_type TEXT NOT NULL,
             topic TEXT NOT NULL,
             role TEXT NOT NULL
@@ -51,6 +55,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             content TEXT NOT NULL,
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
+            source_name TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
             corpus_type TEXT NOT NULL,
             topic TEXT NOT NULL,
             path TEXT NOT NULL
@@ -83,6 +89,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             path TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -92,13 +100,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX idx_documents_type_topic ON documents(corpus_type, topic);
+        CREATE INDEX idx_documents_source ON documents(source_name, source_kind);
         CREATE INDEX idx_chunks_type_topic ON chunks(corpus_type, topic);
+        CREATE INDEX idx_chunks_source ON chunks(source_name, source_kind);
         CREATE INDEX idx_symbols_name ON symbols(name);
         CREATE INDEX idx_symbols_kind ON symbols(kind);
+        CREATE INDEX idx_symbols_source ON symbols(source_name, source_kind);
         """
     )
     conn.execute(
         "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
         ("schema_version", str(SCHEMA_VERSION)),
     )
-

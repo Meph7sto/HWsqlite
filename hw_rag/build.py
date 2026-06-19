@@ -6,14 +6,21 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .chunking import chunk_text
-from .classifier import CODE_EXTENSIONS, classify_path, is_text_file
+from .corpus import (
+    LEGACY_DEFAULT_DB,
+    DatasetConfig,
+    SourceConfig,
+    dataset_to_metadata,
+    default_db_path,
+    load_dataset_manifest,
+    single_source_dataset,
+)
 from .db import connect, init_db
 from .embeddings import Embedder, make_embedder, vector_to_blob
-from .symbols import extract_symbols
+from .plugins import get_plugin
 
 
-DEFAULT_DB = Path("hw_rag.sqlite")
+DEFAULT_DB = LEGACY_DEFAULT_DB
 
 
 def build_database(
@@ -22,35 +29,87 @@ def build_database(
     embedder: Embedder,
     include_tools: bool = True,
 ) -> None:
-    source = source.resolve()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(db_path) as conn:
+    dataset = single_source_dataset(
+        source,
+        include_tools=include_tools,
+        path_prefix="",
+        dataset_name=source.resolve().name,
+    )
+    build_dataset(dataset, db_path, embedder)
+
+
+def build_dataset(
+    dataset: DatasetConfig,
+    db_path: Path | None,
+    embedder: Embedder,
+) -> Path:
+    dataset = dataset.resolved()
+    resolved_db_path = resolve_db_path(dataset, db_path)
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with connect(resolved_db_path) as conn:
         init_db(conn)
-        conn.execute("INSERT INTO corpus_meta(key, value) VALUES (?, ?)", ("source", str(source)))
+        conn.execute(
+            "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
+            ("dataset_name", dataset.name),
+        )
+        conn.execute(
+            "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
+            ("dataset", json.dumps(dataset_to_metadata(dataset), ensure_ascii=False, sort_keys=True)),
+        )
+        if len(dataset.sources) == 1:
+            conn.execute(
+                "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
+                ("source", str(dataset.sources[0].root)),
+            )
         conn.execute(
             "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
             ("embedder", embedder.name),
         )
-        stats = ingest_source(conn, source, embedder, include_tools)
+        stats = ingest_dataset(conn, dataset, embedder)
         conn.execute(
             "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
             ("stats", json.dumps(stats, ensure_ascii=False, sort_keys=True)),
         )
         conn.commit()
+    return resolved_db_path
+
+
+def build_manifest(
+    manifest_path: Path,
+    db_path: Path | None,
+    embedder: Embedder,
+) -> Path:
+    dataset = load_dataset_manifest(manifest_path)
+    return build_dataset(dataset, db_path, embedder)
+
+
+def ingest_dataset(
+    conn: sqlite3.Connection,
+    dataset: DatasetConfig,
+    embedder: Embedder,
+) -> dict[str, object]:
+    total = {"documents": 0, "chunks": 0, "symbols": 0, "skipped": 0}
+    by_source: dict[str, dict[str, int]] = {}
+    for source in dataset.sources:
+        source_stats = ingest_source(conn, source, embedder)
+        by_source[source.name] = source_stats
+        for key in total:
+            total[key] += source_stats[key]
+    return {"total": total, "sources": by_source}
 
 
 def ingest_source(
     conn: sqlite3.Connection,
-    source: Path,
+    source: SourceConfig,
     embedder: Embedder,
-    include_tools: bool,
 ) -> dict[str, int]:
     stats = {"documents": 0, "chunks": 0, "symbols": 0, "skipped": 0}
-    for path in sorted(source.rglob("*")):
+    plugin = get_plugin(source.kind)
+    for path in sorted(source.root.rglob("*")):
         if not path.is_file():
             continue
-        relative_path = path.relative_to(source).as_posix()
-        if should_skip(relative_path, path, include_tools):
+        relative_path = path.relative_to(source.root).as_posix()
+        if plugin.should_skip(relative_path, path, source.include_tools):
             stats["skipped"] += 1
             continue
         try:
@@ -63,19 +122,27 @@ def ingest_source(
                 stats["skipped"] += 1
                 continue
 
-        corpus_type, topic, role = classify_path(relative_path)
+        corpus_type, topic, role = plugin.classify_path(relative_path)
         sha = hashlib.sha256(raw).hexdigest()
+        storage_path = source.storage_path_for(relative_path)
         cursor = conn.execute(
             """
-            INSERT INTO documents(path, abs_path, sha256, size_bytes, extension, corpus_type, topic, role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents(
+                path, relative_path, abs_path, sha256, size_bytes, extension,
+                source_name, source_kind, source_root, corpus_type, topic, role
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                storage_path,
                 relative_path,
                 str(path),
                 sha,
                 len(raw),
                 path.suffix.lower(),
+                source.name,
+                source.kind,
+                str(source.root),
                 corpus_type,
                 topic,
                 role,
@@ -84,15 +151,15 @@ def ingest_source(
         document_id = int(cursor.lastrowid)
         stats["documents"] += 1
 
-        chunks = chunk_text(relative_path, text)
+        chunks = plugin.chunk_text(relative_path, text)
         for chunk_index, chunk in enumerate(chunks):
             chunk_cursor = conn.execute(
                 """
                 INSERT INTO chunks(
                     document_id, chunk_index, title, content, start_line, end_line,
-                    corpus_type, topic, path
+                    source_name, source_kind, corpus_type, topic, path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -101,13 +168,15 @@ def ingest_source(
                     chunk.content,
                     chunk.start_line,
                     chunk.end_line,
+                    source.name,
+                    source.kind,
                     corpus_type,
                     topic,
-                    relative_path,
+                    storage_path,
                 ),
             )
             chunk_id = int(chunk_cursor.lastrowid)
-            vector = embedder.embed(f"{relative_path}\n{chunk.title}\n{chunk.content[:12000]}")
+            vector = embedder.embed(f"{storage_path}\n{chunk.title}\n{chunk.content[:12000]}")
             conn.execute(
                 """
                 INSERT INTO embeddings(chunk_id, provider, dimension, vector)
@@ -117,18 +186,21 @@ def ingest_source(
             )
             stats["chunks"] += 1
 
-        if path.suffix.lower() in CODE_EXTENSIONS:
-            for symbol in extract_symbols(text):
+        if plugin.should_extract_symbols(path):
+            for symbol in plugin.extract_symbols(text):
                 conn.execute(
                     """
                     INSERT INTO symbols(
-                        document_id, path, name, kind, signature, line, corpus_type, topic
+                        document_id, path, source_name, source_kind, name, kind,
+                        signature, line, corpus_type, topic
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         document_id,
-                        relative_path,
+                        storage_path,
+                        source.name,
+                        source.kind,
                         symbol.name,
                         symbol.kind,
                         symbol.signature,
@@ -141,21 +213,22 @@ def ingest_source(
     return stats
 
 
-def should_skip(relative_path: str, path: Path, include_tools: bool) -> bool:
-    normalized = relative_path.replace("\\", "/")
-    if "/figures/" in f"/{normalized}" or path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-        return True
-    if any(part in {".git", "__pycache__", "build", "out"} for part in Path(relative_path).parts):
-        return True
-    if not include_tools and normalized.startswith(("tools/", "scripts/", "tests/")):
-        return True
-    return not is_text_file(path)
+def resolve_db_path(dataset: DatasetConfig, db_path: Path | None) -> Path:
+    if db_path is not None:
+        return db_path.resolve()
+    if dataset.db_path is not None:
+        return dataset.db_path.resolve()
+    return default_db_path(Path.cwd())
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the Ascend C SQLite RAG index.")
-    parser.add_argument("--source", type=Path, default=Path("asc-devkit"))
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser = argparse.ArgumentParser(description="Build a local SQLite RAG index.")
+    parser.add_argument("--dataset", type=Path, help="Path to a dataset manifest JSON file.")
+    parser.add_argument("--source", type=Path, help="Build from a single source root.")
+    parser.add_argument("--source-name", help="Logical source name for single-source builds.")
+    parser.add_argument("--source-kind", help="Source kind override, e.g. asc-devkit or cann-docs.")
+    parser.add_argument("--path-prefix", help="Storage path prefix for single-source builds.")
+    parser.add_argument("--db", type=Path)
     parser.add_argument(
         "--embedding-provider",
         choices=["auto", "hash", "openai"],
@@ -169,10 +242,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     embedder = make_embedder(args.embedding_provider)
-    build_database(args.source, args.db, embedder, include_tools=not args.exclude_tools)
-    print(f"Built {args.db} from {args.source} using {embedder.name}")
+    if args.dataset:
+        db_path = build_manifest(args.dataset, args.db, embedder)
+        print(f"Built {db_path} from dataset {args.dataset} using {embedder.name}")
+        return
+    if not args.source:
+        raise SystemExit("Either --dataset or --source is required.")
+    dataset = single_source_dataset(
+        args.source,
+        name=args.source_name,
+        kind=args.source_kind,
+        include_tools=not args.exclude_tools,
+        path_prefix=args.path_prefix or "",
+        dataset_name=args.source_name or args.source.resolve().name,
+    )
+    db_path = build_dataset(dataset, args.db, embedder)
+    print(f"Built {db_path} from {args.source} using {embedder.name}")
 
 
 if __name__ == "__main__":
     main()
-

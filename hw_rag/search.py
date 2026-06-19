@@ -16,6 +16,8 @@ from .embeddings import blob_to_vector, cosine_similarity, make_embedder
 class SearchResult:
     chunk_id: int
     path: str
+    source_name: str
+    source_kind: str
     title: str
     corpus_type: str
     topic: str
@@ -332,6 +334,7 @@ def _fts_search(
     rows = conn.execute(
         f"""
         SELECT c.id, c.path, c.title, c.corpus_type, c.topic, c.start_line, c.end_line,
+               c.source_name, c.source_kind,
                snippet(chunk_fts, 1, '[', ']', '...', 18) AS snippet,
                bm25(chunk_fts) AS bm25_score
         FROM chunk_fts
@@ -346,6 +349,8 @@ def _fts_search(
         SearchResult(
             chunk_id=row["id"],
             path=row["path"],
+            source_name=row["source_name"],
+            source_kind=row["source_kind"],
             title=row["title"],
             corpus_type=row["corpus_type"],
             topic=row["topic"],
@@ -424,6 +429,7 @@ def _metadata_search(
     rows = conn.execute(
         f"""
         SELECT c.id, c.path, c.title, c.corpus_type, c.topic, c.start_line, c.end_line,
+               c.source_name, c.source_kind,
                substr(c.content, 1, 500) AS snippet,
                {" + ".join(score_clauses)} AS match_score
         FROM chunks c
@@ -446,6 +452,8 @@ def _metadata_search(
         SearchResult(
             chunk_id=row["id"],
             path=row["path"],
+            source_name=row["source_name"],
+            source_kind=row["source_kind"],
             title=row["title"],
             corpus_type=row["corpus_type"],
             topic=row["topic"],
@@ -486,6 +494,7 @@ def _symbol_search(
     rows = conn.execute(
         f"""
         SELECT c.id, c.path, c.title, c.corpus_type, c.topic, c.start_line, c.end_line,
+               c.source_name, c.source_kind,
                s.name, s.kind, s.signature, s.line
         FROM symbols s
         JOIN chunks c ON c.document_id = s.document_id
@@ -511,6 +520,8 @@ def _symbol_search(
         SearchResult(
             chunk_id=row["id"],
             path=row["path"],
+            source_name=row["source_name"],
+            source_kind=row["source_kind"],
             title=row["title"] or row["name"],
             corpus_type=row["corpus_type"],
             topic=row["topic"],
@@ -589,6 +600,7 @@ def _vector_search(
     rows = conn.execute(
         f"""
         SELECT c.id, c.path, c.title, c.corpus_type, c.topic, c.start_line, c.end_line,
+               c.source_name, c.source_kind,
                substr(c.content, 1, 500) AS snippet, e.vector
         FROM chunks c
         JOIN embeddings e ON e.chunk_id = c.id
@@ -611,6 +623,8 @@ def _vector_search(
         SearchResult(
             chunk_id=row["id"],
             path=row["path"],
+            source_name=row["source_name"],
+            source_kind=row["source_kind"],
             title=row["title"],
             corpus_type=row["corpus_type"],
             topic=row["topic"],

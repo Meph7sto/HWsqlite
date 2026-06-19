@@ -1,0 +1,20 @@
+{
+  "name": "ascend-cann-hybrid",
+  "db_path": "hw_rag.sqlite",
+  "sources": [
+    {
+      "name": "asc-devkit",
+      "kind": "asc-devkit",
+      "root": "docs/asc-devkit",
+      "include_tools": true,
+      "path_prefix": "asc-devkit"
+    },
+    {
+      "name": "cann-docs",
+      "kind": "cann-docs",
+      "root": "docs/cann-docs",
+      "include_tools": true,
+      "path_prefix": "cann-docs"
+    }
+  ]
+}

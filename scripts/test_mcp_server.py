@@ -5,8 +5,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from hw_rag.corpus import default_db_path
 
 
 def send(process: subprocess.Popen[str], message: dict) -> dict:
@@ -26,7 +29,7 @@ def main() -> None:
         "-m",
         "hw_rag.mcp_server",
         "--db",
-        str(ROOT / "hw_rag.sqlite"),
+        str(default_db_path(ROOT)),
         "--embedding-provider",
         "hash",
     ]
@@ -70,7 +73,10 @@ def main() -> None:
     assert init["result"]["serverInfo"]["name"] == "ascend-c-rag"
     tool_names = {tool["name"] for tool in tools["result"]["tools"]}
     assert "ascend_rag_search" in tool_names
-    assert "DataCopy" in result["result"]["content"][0]["text"]
+    payload = json.loads(result["result"]["content"][0]["text"])
+    assert payload
+    assert all("path" in item and "source_name" in item for item in payload)
+    assert any(item["source_name"] == "asc-devkit" for item in payload)
     print("mcp smoke test ok")
 
 

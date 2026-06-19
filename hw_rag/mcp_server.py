@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .corpus import default_db_path
 from .db import connect
 from .search import hybrid_search
 
@@ -14,10 +15,12 @@ JSONRPC_VERSION = "2.0"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MCP server for the Ascend C SQLite RAG index.")
-    parser.add_argument("--db", type=Path, default=Path("hw_rag.sqlite"))
+    parser = argparse.ArgumentParser(description="MCP server for the local Ascend/CANN SQLite RAG index.")
+    parser.add_argument("--db", type=Path, default=default_db_path())
     parser.add_argument("--embedding-provider", choices=["auto", "hash", "openai"], default="auto")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.db = validate_db_path(args.db)
+    return args
 
 
 class AscendRagMcpServer:
@@ -51,7 +54,7 @@ class AscendRagMcpServer:
                 "version": "0.1.0",
             },
             "instructions": (
-                "Use this server before writing Ascend C, CANN, SIMD/SIMT, "
+                "Use this server before writing Ascend C, ACLNN/CANN, SIMD/SIMT, "
                 "TPipe/TQue, DataCopy, tiling, or Ascend CMake code. Prefer "
                 "api_reference, headers, and examples over implementation internals."
             ),
@@ -62,8 +65,8 @@ class AscendRagMcpServer:
             {
                 "name": "ascend_rag_search",
                 "description": (
-                    "Hybrid search over asc-devkit: API docs, headers, examples, guides, "
-                    "tests, implementation, and build files."
+                    "Hybrid search over the indexed Ascend/CANN corpora: API docs, headers, "
+                    "examples, guides, tests, implementation, and build files."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -80,7 +83,7 @@ class AscendRagMcpServer:
             },
             {
                 "name": "ascend_rag_read",
-                "description": "Read a chunk or file range from the indexed asc-devkit corpus.",
+                "description": "Read a chunk or file range from the indexed corpora.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -133,6 +136,8 @@ class AscendRagMcpServer:
         payload = [
             {
                 "path": result.path,
+                "source_name": result.source_name,
+                "source_kind": result.source_kind,
                 "title": result.title,
                 "corpus_type": result.corpus_type,
                 "topic": result.topic,
@@ -200,6 +205,7 @@ class AscendRagMcpServer:
                     f"- {item.path}:{item.start_line}-{item.end_line}{title} "
                     f"[{item.source}, score={item.score:.3f}]"
                 )
+                lines.append(f"  corpus={item.source_name}/{item.source_kind}")
                 snippet = " ".join(item.snippet.split())[:500]
                 if snippet:
                     lines.append(f"  {snippet}")
@@ -221,6 +227,26 @@ class AscendRagMcpServer:
 
 def text_content(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
+
+
+def validate_db_path(db_path: Path) -> Path:
+    resolved = db_path.resolve()
+    if not resolved.exists():
+        raise ValueError(f"SQLite database does not exist: {resolved}")
+    with connect(resolved) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    existing = {row["name"] for row in rows}
+    required = {"chunks", "documents", "embeddings", "corpus_meta"}
+    missing = sorted(required - existing)
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"SQLite database is missing required tables: {missing_text}. "
+            f"Resolved path: {resolved}"
+        )
+    return resolved
 
 
 def read_file_range(path: Path, start_line: int, line_count: int) -> str:
@@ -264,4 +290,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
